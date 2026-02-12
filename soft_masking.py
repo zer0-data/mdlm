@@ -13,6 +13,9 @@ class SoftMaskingModule(nn.Module):
         self.omega_s = nn.Parameter(torch.tensor(omega_s_init))
         self.omega_a = nn.Parameter(torch.tensor(omega_a_init))
         self.omega_b = nn.Parameter(torch.tensor(omega_b_init))
+        
+        # Optimization: Register mask_token_id as a buffer to avoid repeated tensor creation
+        self.register_buffer('mask_token_id_tensor', torch.tensor(mask_token_id))
 
     def compute_lambda(self, probs):
         """
@@ -39,8 +42,8 @@ class SoftMaskingModule(nn.Module):
         real_omega_s = torch.sigmoid(self.omega_s)
         # omega_a >= 0 -> softplus
         real_omega_a = F.softplus(self.omega_a)
-        # omega_b (offset) - let's keep it free as learning can adjust it.
-        real_omega_b = self.omega_b
+        # omega_b <= 0 (negative softplus)
+        real_omega_b = -F.softplus(self.omega_b)
         
         inner = real_omega_a * (-entropy - real_omega_b)
         sig = torch.sigmoid(inner)
@@ -77,7 +80,8 @@ class SoftMaskingModule(nn.Module):
         # 2. Get Mask Embedding
         # We can just get it from the embedding layer using the mask definition
         # Assuming embedding_layer supports passing a tensor of IDs
-        mask_vector = embedding_layer(torch.tensor(self.mask_token_id, device=x_t.device)) # (hidden_dim)
+        # usage of registered buffer
+        mask_vector = embedding_layer(self.mask_token_id_tensor) # (hidden_dim)
         
         # 3. Get Feedback Embeddings (Top-K mix)
         feedback_embeds = self.get_topk_embeddings(probs, embedding_layer) # (batch, seq_len, hidden_dim)
