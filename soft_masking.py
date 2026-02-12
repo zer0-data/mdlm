@@ -58,7 +58,7 @@ class SoftMaskingModule(nn.Module):
         topk_probs, topk_indices = torch.topk(probs, self.k, dim=-1)
         
         # Normalize top-k probs
-        topk_probs_norm = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+        topk_probs_norm = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-10)
         
         # Get embeddings: (batch, seq_len, k, hidden_dim)
         topk_embeds = embedding_layer(topk_indices)
