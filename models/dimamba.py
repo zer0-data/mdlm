@@ -1125,12 +1125,12 @@ class DiMamba(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return bias_dropout_add_scale_fused_inference
 
-  def forward(self, indices, sigma):
+  def forward(self, indices, sigma, inputs_embeds=None):
     c = None
     if self.temb_strategy is not None:
       c = F.silu(self.sigma_map(sigma))
 
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-      x = self.model(indices, time_embeds=c).logits
+      x = self.model(indices, inputs_embeds=inputs_embeds, time_embeds=c).logits
 
     return x

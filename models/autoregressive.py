@@ -325,7 +325,7 @@ class AR(DDIT):
     self.mask_index = mask_index
     self.neg_infinity = -1000.0
 
-  def forward(self, xt, sigma):
+  def forward(self, xt, sigma, inputs_embeds=None):
     """Forward pass of the denoising model.
 
     Args:
@@ -338,7 +338,10 @@ class AR(DDIT):
       log probability with shape
           (batch_size, diffusion_model_input_length, vocab_size)
     """
-    x = self.vocab_embed(xt)
+    if inputs_embeds is None:
+        x = self.vocab_embed(xt)
+    else:
+        x = inputs_embeds
 
     rotary_cos_sin = self.rotary_emb(x)
 

@@ -17,6 +17,7 @@ import dataloader
 import models
 import noise_schedule
 import utils
+from soft_masking import SoftMaskingModule
 
 LOG2 = math.log(2)
 
@@ -111,6 +112,21 @@ class Diffusion(L.LightningModule):
 
     self.T = self.config.T
     self.subs_masking = self.config.subs_masking
+    
+    # Soft Masking Initialization
+    # We assume config structure might reference it, or we just initialize it.
+    # User asked to Refactor existing code.
+    self.use_soft_masking = getattr(self.config, 'use_soft_masking', False)
+    if self.use_soft_masking:
+        self.soft_masking_module = SoftMaskingModule(
+            hidden_size=self.config.model.hidden_size,
+            vocab_size=self.vocab_size, 
+            mask_token_id=self.mask_index
+        )
+        self.p_sm = getattr(self.config.training, 'p_sm', 0.5)
+    else:
+        self.soft_masking_module = None
+        self.p_sm = 0.0
 
     self.softplus = torch.nn.Softplus()
     # metrics are automatically reset at end of epoch
@@ -309,11 +325,29 @@ class Diffusion(L.LightningModule):
     assert sigma.ndim == 1, sigma.shape
     return sigma
 
-  def forward(self, x, sigma):
+  def _get_embedding_layer(self):
+    if hasattr(self.backbone, 'vocab_embed'):
+        return self.backbone.vocab_embed
+    elif hasattr(self.backbone, 'get_input_embeddings'):
+        # HF models
+        return self.backbone.get_input_embeddings()
+    elif hasattr(self.backbone, 'model') and hasattr(self.backbone.model, 'get_input_embeddings'):
+        # DiMamba wrapper
+        return self.backbone.model.get_input_embeddings()
+    else:
+        # Fallback or specific checks
+        raise AttributeError(f"Could not find embedding layer in backbone: {type(self.backbone)}")
+
+  def forward(self, x, sigma, inputs_embeds=None):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits = self.backbone(x, sigma)
+      if inputs_embeds is not None:
+         # Only pass inputs_embeds to backbone if it accepts it (DIT does now)
+         # We assume backbone is DIT or updated to support it if soft masking is used.
+         logits = self.backbone(x, sigma, inputs_embeds=inputs_embeds)
+      else:
+         logits = self.backbone(x, sigma)
     
     if self.parameterization == 'subs':
       return self._subs_parameterization(logits=logits,
@@ -451,9 +485,12 @@ class Diffusion(L.LightningModule):
     #  "Detected call of `lr_scheduler.step()` before `optimizer.step()`. "
     #  Not clear if this is a problem or not.
     #  See: https://github.com/Lightning-AI/pytorch-lightning/issues/5558
+    params = list(self.backbone.parameters()) + list(self.noise.parameters())
+    if self.soft_masking_module is not None:
+        params += list(self.soft_masking_module.parameters())
+
     optimizer = torch.optim.AdamW(
-      itertools.chain(self.backbone.parameters(),
-                      self.noise.parameters()),
+      params,
       lr=self.config.optim.lr,
       betas=(self.config.optim.beta1,
              self.config.optim.beta2),
@@ -622,8 +659,28 @@ class Diffusion(L.LightningModule):
     move_chance_s = 1 - torch.exp(-sigma_s)
     move_chance_t = move_chance_t[:, None, None]
     move_chance_s = move_chance_s[:, None, None]
+    move_chance_s = move_chance_s[:, None, None]
     unet_conditioning = sigma_t
-    log_p_x0 = self.forward(x, unet_conditioning)
+    
+    if self.use_soft_masking and self.soft_masking_module is not None:
+        # --- Soft Masking Two-Pass Inference ---
+        # Pass 1
+        logits_1 = self.forward(x, unet_conditioning)
+        probs_1 = logits_1.softmax(dim=-1)
+        
+        # Soft Mix
+        embedding_layer = self._get_embedding_layer()
+        soft_inputs = self.soft_masking_module(
+            x_t=x,
+            probs=probs_1,
+            embedding_layer=embedding_layer
+        )
+        
+        # Pass 2
+        log_p_x0 = self.forward(x, unet_conditioning, inputs_embeds=soft_inputs)
+    else:
+        log_p_x0 = self.forward(x, unet_conditioning)
+        
     assert move_chance_t.ndim == log_p_x0.ndim
     # Technically, this isn't q_xs since there's a division
     # term that is missing. This division term doesn't affect
@@ -694,7 +751,25 @@ class Diffusion(L.LightningModule):
         x = self._denoiser_update(x, t)
       else:
         unet_conditioning = self.noise(t)[0]
-        x = self.forward(x, unet_conditioning).argmax(dim=-1)
+        
+        if self.use_soft_masking and self.soft_masking_module is not None:
+             # --- Soft Masking Two-Pass Final Step ---
+             # Pass 1
+             logits_1 = self.forward(x, unet_conditioning)
+             probs_1 = logits_1.softmax(dim=-1)
+             
+             # Soft Mix
+             embedding_layer = self._get_embedding_layer()
+             soft_inputs = self.soft_masking_module(
+                 x_t=x,
+                 probs=probs_1,
+                 embedding_layer=embedding_layer
+             )
+             
+             # Pass 2
+             x = self.forward(x, unet_conditioning, inputs_embeds=soft_inputs).argmax(dim=-1)
+        else:    
+             x = self.forward(x, unet_conditioning).argmax(dim=-1)
     return x
 
   def restore_model_and_sample(self, num_steps, eps=1e-5):
@@ -864,7 +939,43 @@ class Diffusion(L.LightningModule):
       move_chance = 1 - torch.exp(-sigma[:, None])
 
     xt = self.q_xt(x0, move_chance)
-    model_output = self.forward(xt, unet_conditioning)
+    
+    # Stochastic Soft-Masking Gate
+    do_soft_masking = (
+        self.use_soft_masking 
+        and self.soft_masking_module is not None 
+        and (torch.rand(1).item() < self.p_sm)
+    )
+
+    if do_soft_masking:
+        # --- Soft Masking Two-Pass Training ---
+        
+        # Pass 1: Get probabilities from current model state (detached)
+        with torch.no_grad():
+            # Standard forward to get logits
+            logits_1 = self.forward(xt, unet_conditioning)
+            probs_1 = logits_1.softmax(dim=-1)
+        
+        # Compute Soft Embeddings
+        # We need the embedding layer from the backbone to look up tokens
+        embedding_layer = self._get_embedding_layer()
+        
+        # Calculate soft embeddings
+        soft_inputs = self.soft_masking_module(
+            x_t=xt,
+            probs=probs_1,
+            embedding_layer=embedding_layer
+            # t argument removed as per new formula
+        )
+        
+        # Pass 2: Forward with Soft Embeddings
+        # We pass soft_inputs as inputs_embeds
+        model_output = self.forward(xt, unet_conditioning, inputs_embeds=soft_inputs)
+        
+    else:
+        # Standard Single Pass
+        model_output = self.forward(xt, unet_conditioning)
+
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':

@@ -356,8 +356,11 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, indices, sigma):
-    x = self.vocab_embed(indices)
+  def forward(self, indices, sigma, inputs_embeds=None):
+    if inputs_embeds is None:
+      x = self.vocab_embed(indices)
+    else:
+      x = inputs_embeds
     c = F.silu(self.sigma_map(sigma))
 
     rotary_cos_sin = self.rotary_emb(x)
