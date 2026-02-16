@@ -15,9 +15,10 @@ class SoftMaskingModule(nn.Module):
         self.omega_b = nn.Parameter(torch.tensor(omega_b_init))
         
         # Optimization: Register mask_token_id as a buffer to avoid repeated tensor creation
-        self.register_buffer('mask_token_id_tensor', torch.tensor(mask_token_id))
+        self.register_buffer('mask_token_id_tensor', torch.tensor(mask_token_id,dtype= torch.long))
 
     def compute_lambda(self, probs):
+
         """
         Computes the mixing coefficient lambda.
         probs: (batch, seq_len, vocab_size) - Probability distribution
@@ -26,13 +27,15 @@ class SoftMaskingModule(nn.Module):
         # Calculate Entropy
         # H(p) = - sum p * log p
         # Add epsilon to avoid log(0)
-        log_probs = torch.log(probs + 1e-10)
-        entropy = -torch.sum(probs * log_probs, dim=-1) # (batch, seq_len)
+
+        # log_probs = torch.log(probs + 1e-10)
+        # entropy = -torch.sum(probs * log_probs, dim=-1) # (batch, seq_len)
+        entropy = torch.special.entr(probs).sum(dim=-1) # (batch, seq_len)
         
         # Compute lambda
         # omega_s * sigmoid(omega_a * (-entropy - omega_b))
         # Note: -H(p) is negative entropy (higher confidence -> lower entropy -> higher negative entropy)
-        
+         
         # We need to ensure shapes broadcast correctly. 
         # entropy is (batch, seq_len)
         # parameters are scalars.
@@ -77,30 +80,24 @@ class SoftMaskingModule(nn.Module):
         # 1. Identify masks
         is_mask = (x_t == self.mask_token_id).unsqueeze(-1).float() # (batch, seq_len, 1)
         
-        # 2. Get Mask Embedding
-        # We can just get it from the embedding layer using the mask definition
-        # Assuming embedding_layer supports passing a tensor of IDs
-        # usage of registered buffer
+        real_embeds = embedding_layer(x_t) # (batch, seq_len, hidden_dim)
+
+        # Optimization: Only compute soft-masking if there are actually masked tokens
+        if not is_mask.any():
+            return real_embeds
+
+        # 3. Get Mask Embedding
         mask_vector = embedding_layer(self.mask_token_id_tensor) # (hidden_dim)
         
-        # 3. Get Feedback Embeddings (Top-K mix)
+        # 4. Get Feedback Embeddings & Lambda
         feedback_embeds = self.get_topk_embeddings(probs, embedding_layer) # (batch, seq_len, hidden_dim)
-
-        # 4. Compute Lambda
         lam = self.compute_lambda(probs) # (batch, seq_len, 1)
         
         # 5. Mix: Mask vs Feedback
-        # mixture = lambda * feedback + (1 - lambda) * mask
         soft_mask_embeds = lam * feedback_embeds + (1 - lam) * mask_vector
         
-        # 6. Final Combination:
-        # If token is NOT blocked/masked, use its original embedding.
-        # If token IS masked, use the soft mixture.
-        # However, MDLM usually feeds x_t which has [MASK] tokens.
-        # So we just replacing the embedding at masked positions.
-        
-        real_embeds = embedding_layer(x_t)
-        
-        final_embeds = (1 - is_mask) * real_embeds + is_mask * soft_mask_embeds
+        # 6. Final Combination using torch.where for better performance
+        # Replaces embeddings only where is_mask is True
+        final_embeds = torch.where(is_mask, soft_mask_embeds, real_embeds)
         
         return final_embeds
