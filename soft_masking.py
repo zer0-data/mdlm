@@ -3,10 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class SoftMaskingModule(nn.Module):
-    def __init__(self, hidden_size, vocab_size, mask_token_id, k=5, omega_s_init=-1.0, omega_a_init=0.0, omega_b_init=0.0):
+    def __init__(self, hidden_size, vocab_size, mask_token_id, k=3, omega_s_init=0.5, omega_a_init=0.9, omega_b_init=0.3, interp_mode = 'linear'):
         super().__init__()
         self.k = k
         self.mask_token_id = mask_token_id
+
+        valid_modes = ['linear', 'spherical']
+        if interp_mode not in valid_modes:
+            raise ValueError(f"interp_mode must be one of {valid_modes}")
+        self.interp_mode = interp_mode
         
         # Learnable parameters for lambda calculation
         # Formula: lambda = sigmoid(omega_s * Entropy + omega_a * t + omega_b)
@@ -16,6 +21,8 @@ class SoftMaskingModule(nn.Module):
         
         # Optimization: Register mask_token_id as a buffer to avoid repeated tensor creation
         self.register_buffer('mask_token_id_tensor', torch.tensor(mask_token_id,dtype= torch.long))
+
+        
 
     def compute_lambda(self, probs):
 
@@ -70,6 +77,37 @@ class SoftMaskingModule(nn.Module):
         feedback_embeds = torch.sum(topk_embeds * topk_probs_norm.unsqueeze(-1), dim=2)
         
         return feedback_embeds
+    
+    def _interpolate(self, lam, v0, v1, dot_threshold=0.9995):
+        """
+        Routes the tensors through the selected interpolation strategy.
+        lam: (batch, seq_len, 1) - mixing coefficient
+        v0: (batch, seq_len, hidden_dim) - base mask embedding
+        v1: (batch, seq_len, hidden_dim) - feedback prediction embedding
+        """
+        if self.interp_mode == 'linear':
+            # Standard LERP
+            return (1.0 - lam) * v0 + lam * v1
+            
+        elif self.interp_mode == 'spherical':
+            # SLERP with LERP fallback for collinear vectors
+            v0_norm = F.normalize(v0, p=2, dim=-1)
+            v1_norm = F.normalize(v1, p=2, dim=-1)
+            
+            dot = torch.sum(v0_norm * v1_norm, dim=-1, keepdim=True)
+            lerp_mask = (dot > dot_threshold)
+            
+            dot = torch.clamp(dot, -1.0 + 1e-7, 1.0 - 1e-7)
+            omega = torch.acos(dot)
+            so = torch.sin(omega)
+            
+            c0 = torch.sin((1.0 - lam) * omega) / so
+            c1 = torch.sin(lam * omega) / so
+            
+            slerp_out = c0 * v0 + c1 * v1
+            lerp_out = (1.0 - lam) * v0 + lam * v1
+            
+            return torch.where(lerp_mask, lerp_out, slerp_out)
 
     def forward(self, x_t, probs, embedding_layer):
         """
@@ -77,27 +115,30 @@ class SoftMaskingModule(nn.Module):
         probs: (batch, seq_len, vocab_size) - Predicted probabilities from Pass 1
         embedding_layer: function or module that takes indices and returns embeddings
         """
-        # 1. Identify masks
-        is_mask = (x_t == self.mask_token_id).unsqueeze(-1).float() # (batch, seq_len, 1)
-        
-        real_embeds = embedding_layer(x_t) # (batch, seq_len, hidden_dim)
 
-        # Optimization: Only compute soft-masking if there are actually masked tokens
+       # 1. Input Validation
+        if not torch.allclose(probs.sum(dim=-1), torch.ones_like(probs.sum(dim=-1)), atol=1e-3):
+            raise ValueError("Input `probs` must sum to 1. Did you pass raw logits?")
+
+        # 2. Identify Masks
+        is_mask = (x_t == self.mask_token_id).unsqueeze(-1) # (batch, seq_len, 1) bool
+        
+        # 3. Base Embeddings
+        real_embeds = embedding_layer(x_t)
+        
+        # Optimization: Return early if no masks are present
         if not is_mask.any():
             return real_embeds
 
-        # 3. Get Mask Embedding
-        mask_vector = embedding_layer(self.mask_token_id_tensor) # (hidden_dim)
+        # 4. Compute Feedback and Lambda
+        feedback_embeds = self.get_topk_embeddings(probs, embedding_layer)
+        lam = self.compute_lambda(probs)
         
-        # 4. Get Feedback Embeddings & Lambda
-        feedback_embeds = self.get_topk_embeddings(probs, embedding_layer) # (batch, seq_len, hidden_dim)
-        lam = self.compute_lambda(probs) # (batch, seq_len, 1)
+        # 5. Route through the selected interpolation strategy
+        # Note: real_embeds acts as the mask_vector (v0) at masked positions
+        soft_mask_embeds = self._interpolate(lam, v0=real_embeds, v1=feedback_embeds)
         
-        # 5. Mix: Mask vs Feedback
-        soft_mask_embeds = lam * feedback_embeds + (1 - lam) * mask_vector
-        
-        # 6. Final Combination using torch.where for better performance
-        # Replaces embeddings only where is_mask is True
+        # 6. Final Masking
         final_embeds = torch.where(is_mask, soft_mask_embeds, real_embeds)
         
         return final_embeds
