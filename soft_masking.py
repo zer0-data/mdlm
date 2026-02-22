@@ -48,8 +48,10 @@ class SoftMaskingModule(nn.Module):
         # parameters are scalars.
         
         # Re-parameterization to enforce the paper's parameter constraints (Eq. 2)
-        # omega_s in [0, 1]  ->  sigmoid keeps it bounded
-        real_omega_s = torch.sigmoid(self.omega_s)
+        # omega_s in [0, 1]  ->  hard clamp preserves full gradient within
+        #   the valid range and avoids the sigmoid saturation that makes it
+        #   nearly impossible to reach omega_s ≈ 1.0 (paper Fig. 3b).
+        real_omega_s = self.omega_s.clamp(0.0, 1.0)
         # omega_a >= 0       ->  softplus is always positive
         real_omega_a = F.softplus(self.omega_a)
         # omega_b <= 0       ->  negated softplus is always negative.
@@ -121,29 +123,35 @@ class SoftMaskingModule(nn.Module):
         embedding_layer: function or module that takes indices and returns embeddings
         """
 
-       # 1. Input Validation
+        # 1. Input Validation
         if not torch.allclose(probs.sum(dim=-1), torch.ones_like(probs.sum(dim=-1)), atol=1e-3):
             raise ValueError("Input `probs` must sum to 1. Did you pass raw logits?")
 
         # 2. Identify Masks
-        is_mask = (x_t == self.mask_token_id).unsqueeze(-1) # (batch, seq_len, 1) bool
+        is_mask = (x_t == self.mask_token_id)          # (batch, seq_len) bool
         
-        # 3. Base Embeddings
-        real_embeds = embedding_layer(x_t)
+        # 3. Base Embeddings (for unmasked positions these are the real tokens)
+        real_embeds = embedding_layer(x_t)             # (batch, seq_len, H)
         
         # Optimization: Return early if no masks are present
         if not is_mask.any():
             return real_embeds
 
-        # 4. Compute Feedback and Lambda
+        # 4. Build v0: ALWAYS the mask-token embedding (paper Eq. 4)
+        #    This avoids using real_embeds as v0, which would contain
+        #    ground-truth embeddings at unmasked positions.
+        mask_embed = embedding_layer(self.mask_token_id_tensor)  # (H,)
+        v0 = mask_embed.expand_as(real_embeds)                   # (B, L, H)
+
+        # 5. Compute feedback & lambda
         feedback_embeds = self.get_topk_embeddings(probs, embedding_layer)
-        lam = self.compute_lambda(probs)
+        lam = self.compute_lambda(probs)               # (B, L, 1)
         
-        # 5. Route through the selected interpolation strategy
-        # Note: real_embeds acts as the mask_vector (v0) at masked positions
-        soft_mask_embeds = self._interpolate(lam, v0=real_embeds, v1=feedback_embeds)
+        # 6. Interpolate: v0 = mask embedding, v1 = top-k feedback
+        soft_mask_embeds = self._interpolate(lam, v0=v0, v1=feedback_embeds)
         
-        # 6. Final Masking
-        final_embeds = torch.where(is_mask, soft_mask_embeds, real_embeds)
+        # 7. Apply only at masked positions; unmasked keep real_embeds
+        is_mask_3d = is_mask.unsqueeze(-1)             # (B, L, 1) bool
+        final_embeds = torch.where(is_mask_3d, soft_mask_embeds, real_embeds)
         
         return final_embeds
