@@ -353,10 +353,13 @@ class Diffusion(L.LightningModule):
     and a second (differentiable) pass with the soft inputs.
     At inference use _build_soft_inputs + a single self.forward() call.
     """
-    # Pass 1: detached — get probabilities only
+    # Pass 1: detached — get RAW (pre-parameterization) probabilities.
+    # We must NOT feed parameterized probs into SoftMaskingModule because
+    # _subs_parameterization forces mask-index to -inf and unmasked to
+    # one-hot, collapsing entropy and corrupting the feedback signal.
     with torch.no_grad():
-        logits_1 = self.forward(x, sigma)
-        probs_1 = logits_1.softmax(dim=-1)
+        raw_logits, _ = self._forward_pass_raw(x, sigma)
+        probs_1 = raw_logits.softmax(dim=-1)
 
     # Pass 2: differentiable forward with soft embeddings
     soft_inputs = self._build_soft_inputs(x, probs_1)
@@ -407,6 +410,37 @@ class Diffusion(L.LightningModule):
     elif self.parameterization == 'd3pm':
       return self._d3pm_parameterization(logits=logits)
     return logits
+
+  def _forward_pass_raw(self, x, sigma, inputs_embeds=None):
+    """Run backbone and return (raw_logits, parameterized_log_probs).
+
+    raw_logits are the backbone output BEFORE any parameterization.
+    parameterized_log_probs are the usual output of forward().
+    We clone before parameterization because the parameterization
+    functions mutate logits in-place.
+    """
+    sigma = self._process_sigma(sigma)
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      if inputs_embeds is not None:
+         logits = self.backbone(x, sigma, inputs_embeds=inputs_embeds)
+      else:
+         logits = self.backbone(x, sigma)
+
+    raw_logits = logits  # save reference BEFORE parameterization
+
+    if self.parameterization == 'subs':
+      param_logits = self._subs_parameterization(
+        logits=logits.clone(), xt=x)
+    elif self.parameterization == 'sedd':
+      param_logits = self._sedd_parameterization(
+        logits=logits.clone(), xt=x, sigma=sigma)
+    elif self.parameterization == 'd3pm':
+      param_logits = self._d3pm_parameterization(
+        logits=logits.clone())
+    else:
+      param_logits = logits
+
+    return raw_logits, param_logits
 
   def _d3pm_loss(self, model_output, xt, x0, t):
     dt = 1 / self.T
@@ -724,10 +758,15 @@ class Diffusion(L.LightningModule):
     if self.use_soft_masking and self.soft_masking_module is not None:
         # Single pass: build soft embeddings from PREVIOUS step's probs
         soft_inputs = self._build_soft_inputs(x, prev_probs)
-        log_p_x0 = self.forward(x, unet_conditioning,
-                                inputs_embeds=soft_inputs)
+        raw_logits, log_p_x0 = self._forward_pass_raw(
+            x, unet_conditioning, inputs_embeds=soft_inputs)
+        # Cache raw (pre-parameterization) probs for the NEXT step's
+        # soft-masking module.  Parameterized probs have mask-index
+        # forced to 0, collapsing entropy and corrupting feedback.
+        raw_probs = raw_logits.softmax(dim=-1)
     else:
         log_p_x0 = self.forward(x, unet_conditioning)
+        raw_probs = None
 
     assert move_chance_t.ndim == log_p_x0.ndim
     # Technically, this isn't q_xs since there's a division
@@ -739,7 +778,7 @@ class Diffusion(L.LightningModule):
 
     copy_flag = (x != self.mask_index).to(x.dtype)
     x_next = copy_flag * x + (1 - copy_flag) * _x
-    return log_p_x0, x_next
+    return log_p_x0, x_next, raw_probs
 
   def _ar_sampler(self, bsz):
     # precompute token buffer
@@ -782,13 +821,12 @@ class Diffusion(L.LightningModule):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
-        # _ddpm_update now returns (log_p_x0, x_next) and accepts
-        # prev_probs for single-pass soft masking.
-        log_p_x0, x = self._ddpm_update(x, t, dt,
-                                         prev_probs=sm_prev_probs)
-        # Cache probs for the next step's soft-embedding construction
+        # _ddpm_update returns (log_p_x0, x_next, raw_probs)
+        log_p_x0, x, raw_probs = self._ddpm_update(
+            x, t, dt, prev_probs=sm_prev_probs)
+        # Cache RAW (pre-parameterization) probs for the next step
         if self.use_soft_masking and self.soft_masking_module is not None:
-          sm_prev_probs = log_p_x0.exp()
+          sm_prev_probs = raw_probs
       elif self.sampler == 'ddpm_cache':
         p_x0_cache, x_next = self._ddpm_caching_update(
           x, t, dt, p_x0=p_x0_cache)
