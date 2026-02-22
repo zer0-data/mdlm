@@ -15,6 +15,15 @@ time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
 
+# ── Soft Masking (SM-MDLM) ──────────────────────────────────────────
+# Set use_soft_masking to True to enable the two-pass soft masking
+# mechanism described in the SM-MDLM paper.
+use_soft_masking: True
+sm_topk: 3               # K for Top-K feedback embeddings (paper default)
+sm_feedback_mode: topk    # 'topk' (paper default) or 'full' (ablation, Table 3)
+sm_tau_init: 1.0          # Initial temperature for 'full' feedback mode
+
+
 seed: 1
 
 loader:
@@ -49,6 +58,7 @@ training:
   # Paper default: (b_l, b_h) = (0.2, 0.8).
   t_min: 0.2
   t_max: 0.8
+  p_sm: 0.5              # Probability of using soft-masking per training step
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.

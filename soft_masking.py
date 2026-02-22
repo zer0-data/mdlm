@@ -42,6 +42,10 @@ class SoftMaskingModule(nn.Module):
         probs: (batch, seq_len, vocab_size) - Probability distribution
         Formula from paper Eq. 2: lambda(p) = omega_s * sigmoid(omega_a * (-H(p) - omega_b))
         """
+        # Guard against AMP half-precision: entr() on near-zero fp16/bf16
+        # values can produce NaNs.  Force float32 for the entropy path.
+        probs = probs.float()
+
         # Calculate Entropy
         # H(p) = - sum p * log p
         # Add epsilon to avoid log(0)
@@ -83,6 +87,12 @@ class SoftMaskingModule(nn.Module):
         """
         Get weighted average of top-k embeddings.
         """
+        # Zero out the [MASK] token probability before top-k selection.
+        # If the model is uncertain, [MASK] can appear in top-k, wasting a
+        # slot by blending the mask embedding with itself.
+        probs = probs.clone()
+        probs[..., self.mask_token_id] = 0.0
+
         topk_probs, topk_indices = torch.topk(probs, self.k, dim=-1)
         
         # Normalize top-k probs
