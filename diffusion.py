@@ -124,9 +124,16 @@ class Diffusion(L.LightningModule):
             mask_token_id=self.mask_index
         )
         self.p_sm = getattr(self.config.training, 'p_sm', 0.5)
+        # Clipped noise schedule (Algorithm 1 / Appendix A.2).
+        # Timestep is sampled from [t_min, t_max] to avoid high-variance
+        # gradient regions at the extremes of the diffusion schedule.
+        self.t_min = getattr(self.config.training, 't_min', 0.2)
+        self.t_max = getattr(self.config.training, 't_max', 0.8)
     else:
         self.soft_masking_module = None
         self.p_sm = 0.0
+        self.t_min = self.sampling_eps  # baseline: full schedule
+        self.t_max = 1.0
 
     self.softplus = torch.nn.Softplus()
     # metrics are automatically reset at end of epoch
@@ -339,22 +346,45 @@ class Diffusion(L.LightningModule):
         raise AttributeError(f"Could not find embedding layer in backbone: {type(self.backbone)}")
 
   def _forward_with_soft_masking(self, x, sigma):
-    """Helper for two-pass soft masking forward."""
-    # Pass 1: Get probabilities from current model state (detached)
+    """Two-pass soft masking forward — used ONLY during training.
+
+    During training we need gradients to flow through the soft
+    embeddings, so we run a detached first pass to get probabilities
+    and a second (differentiable) pass with the soft inputs.
+    At inference use _build_soft_inputs + a single self.forward() call.
+    """
+    # Pass 1: detached — get probabilities only
     with torch.no_grad():
         logits_1 = self.forward(x, sigma)
         probs_1 = logits_1.softmax(dim=-1)
-    
-    # Compute Soft Embeddings
+
+    # Pass 2: differentiable forward with soft embeddings
+    soft_inputs = self._build_soft_inputs(x, probs_1)
+    return self.forward(x, sigma, inputs_embeds=soft_inputs)
+
+  def _build_soft_inputs(self, x, prev_probs):
+    """Build soft-masked input embeddings from *previous-step* probs.
+
+    This is pure embedding arithmetic — zero extra forward passes.
+    Called at inference time to keep NFE identical to the baseline.
+
+    Args:
+      x:          (batch, seq_len) current token ids.
+      prev_probs: (batch, seq_len, vocab_size) probability tensor from
+                  the *previous* decoding step, or None for step 0
+                  (falls back to plain token embeddings).
+    Returns:
+      inputs_embeds: (batch, seq_len, hidden_dim) to pass to forward().
+    """
     embedding_layer = self._get_embedding_layer()
-    soft_inputs = self.soft_masking_module(
+    if prev_probs is None:
+        # Step 0: no prior predictions, use plain embeddings
+        return embedding_layer(x)
+    return self.soft_masking_module(
         x_t=x,
-        probs=probs_1,
+        probs=prev_probs,
         embedding_layer=embedding_layer
     )
-    
-    # Pass 2: Forward with Soft Embeddings
-    return self.forward(x, sigma, inputs_embeds=soft_inputs)
 
   def forward(self, x, sigma, inputs_embeds=None):
     """Returns log score."""
@@ -664,7 +694,19 @@ class Diffusion(L.LightningModule):
     copy_flag = (x != self.mask_index).to(x.dtype)
     return p_x0, copy_flag * x + (1 - copy_flag) * _x
 
-  def _ddpm_update(self, x, t, dt):
+  def _ddpm_update(self, x, t, dt, prev_probs=None):
+    """Single-pass DDPM update.
+
+    When soft masking is active the caller supplies `prev_probs` (the
+    probability tensor returned by the *previous* call to this method).
+    These are used to build soft embeddings before the single forward
+    pass, keeping NFE == 1 per step (same as the baseline).
+
+    Returns:
+      log_p_x0: log-probability tensor for this step (use as prev_probs
+                for the next step).
+      x_next:   updated token sequence.
+    """
     sigma_t, _ = self.noise(t)
     sigma_s, _ = self.noise(t - dt)
     if sigma_t.ndim > 1:
@@ -677,25 +719,27 @@ class Diffusion(L.LightningModule):
     move_chance_s = 1 - torch.exp(-sigma_s)
     move_chance_t = move_chance_t[:, None, None]
     move_chance_s = move_chance_s[:, None, None]
-    move_chance_s = move_chance_s[:, None, None]
     unet_conditioning = sigma_t
-    
+
     if self.use_soft_masking and self.soft_masking_module is not None:
-        log_p_x0 = self._forward_with_soft_masking(x, unet_conditioning)
+        # Single pass: build soft embeddings from PREVIOUS step's probs
+        soft_inputs = self._build_soft_inputs(x, prev_probs)
+        log_p_x0 = self.forward(x, unet_conditioning,
+                                inputs_embeds=soft_inputs)
     else:
         log_p_x0 = self.forward(x, unet_conditioning)
-        
+
     assert move_chance_t.ndim == log_p_x0.ndim
     # Technically, this isn't q_xs since there's a division
     # term that is missing. This division term doesn't affect
     # the samples.
-    q_xs = log_p_x0.exp() * (move_chance_t
-                             - move_chance_s)
+    q_xs = log_p_x0.exp() * (move_chance_t - move_chance_s)
     q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
     _x = _sample_categorical(q_xs)
 
     copy_flag = (x != self.mask_index).to(x.dtype)
-    return copy_flag * x + (1 - copy_flag) * _x
+    x_next = copy_flag * x + (1 - copy_flag) * _x
+    return log_p_x0, x_next
 
   def _ar_sampler(self, bsz):
     # precompute token buffer
@@ -731,12 +775,20 @@ class Diffusion(L.LightningModule):
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
     p_x0_cache = None
+    # Soft-masking prev-step probs cache (inference only, no extra NFE)
+    sm_prev_probs = None
 
     for i in range(num_steps):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
-        x = self._ddpm_update(x, t, dt)
+        # _ddpm_update now returns (log_p_x0, x_next) and accepts
+        # prev_probs for single-pass soft masking.
+        log_p_x0, x = self._ddpm_update(x, t, dt,
+                                         prev_probs=sm_prev_probs)
+        # Cache probs for the next step's soft-embedding construction
+        if self.use_soft_masking and self.soft_masking_module is not None:
+          sm_prev_probs = log_p_x0.exp()
       elif self.sampler == 'ddpm_cache':
         p_x0_cache, x_next = self._ddpm_caching_update(
           x, t, dt, p_x0=p_x0_cache)
@@ -755,11 +807,13 @@ class Diffusion(L.LightningModule):
         x = self._denoiser_update(x, t)
       else:
         unet_conditioning = self.noise(t)[0]
-        
         if self.use_soft_masking and self.soft_masking_module is not None:
-             x = self._forward_with_soft_masking(x, unet_conditioning).argmax(dim=-1)
-        else:    
-             x = self.forward(x, unet_conditioning).argmax(dim=-1)
+          # Single-pass: reuse probs from last decoding step
+          soft_inputs = self._build_soft_inputs(x, sm_prev_probs)
+          x = self.forward(x, unet_conditioning,
+                           inputs_embeds=soft_inputs).argmax(dim=-1)
+        else:
+          x = self.forward(x, unet_conditioning).argmax(dim=-1)
     return x
 
   def restore_model_and_sample(self, num_steps, eps=1e-5):
@@ -783,9 +837,12 @@ class Diffusion(L.LightningModule):
     self.noise.train()
     return samples
 
-  def get_score(self, x, sigma):
+  def get_score(self, x, sigma, prev_probs=None):
+    """Single forward pass. For soft masking, pass prev_probs from the
+    previous decoding step to avoid an extra NFE."""
     if self.use_soft_masking and self.soft_masking_module is not None:
-        model_output = self._forward_with_soft_masking(x, sigma)
+        soft_inputs = self._build_soft_inputs(x, prev_probs)
+        model_output = self.forward(x, sigma, inputs_embeds=soft_inputs)
     else:
         model_output = self.forward(x, sigma)
     if self.parameterization == 'subs':
@@ -866,11 +923,20 @@ class Diffusion(L.LightningModule):
     return edge
 
   def _sample_t(self, n, device):
+    """Sample training timesteps from [t_min, t_max].
+
+    For SM-MDLM, t_min/t_max implement the clipped noise schedule
+    (Algorithm 1, Appendix A.2): sampling extreme t values causes
+    high gradient variance, so we restrict to (b_l, b_h) = (0.2, 0.8)
+    by default.  For the unmodified MDLM baseline the full schedule
+    [sampling_eps, 1] is preserved.
+    """
     _eps_t = torch.rand(n, device=device)
     if self.antithetic_sampling:
       offset = torch.arange(n, device=device) / n
       _eps_t = (_eps_t / n + offset) % 1
-    t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps
+    # Map the [0, 1) uniform sample into [t_min, t_max]
+    t = self.t_min + (self.t_max - self.t_min) * _eps_t
     if self.importance_sampling:
       return self.noise.importance_sampling_transformation(t)
     return t

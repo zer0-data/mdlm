@@ -47,15 +47,20 @@ class SoftMaskingModule(nn.Module):
         # entropy is (batch, seq_len)
         # parameters are scalars.
         
-        # Re-parameterization to enforce constraints
-        # omega_s in [0, 1] -> sigmoid
+        # Re-parameterization to enforce the paper's parameter constraints (Eq. 2)
+        # omega_s in [0, 1]  ->  sigmoid keeps it bounded
         real_omega_s = torch.sigmoid(self.omega_s)
-        # omega_a >= 0 -> softplus
+        # omega_a >= 0       ->  softplus is always positive
         real_omega_a = F.softplus(self.omega_a)
-        # omega_b <= 0 (negative softplus)
+        # omega_b <= 0       ->  negated softplus is always negative.
         real_omega_b = -F.softplus(self.omega_b)
-        
-        inner = real_omega_a * (-entropy - real_omega_b)
+
+        # NOTE: intentional double-negative below.
+        # Paper formula:  omega_a * (-H(p) - omega_b),  where omega_b <= 0.
+        # So -omega_b >= 0, meaning the bias *adds* to -H(p), shifting the
+        # sigmoid rightward (toward more certainty before masking kicks in).
+        # Example: -H(p) - (-5)  ==  -H(p) + 5.  Mathematically correct.
+        inner = real_omega_a * (-entropy - real_omega_b)  # == omega_a*(-H(p) - omega_b)
         sig = torch.sigmoid(inner)
         lam = real_omega_s * sig
         

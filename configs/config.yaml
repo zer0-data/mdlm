@@ -43,6 +43,12 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
+  # Clipped noise schedule bounds (Algorithm 1 / Appendix A.2 of SM-MDLM paper).
+  # Timestep t is sampled from [t_min, t_max] during training to avoid the
+  # high-gradient-variance regions near t=0 and t=1.
+  # Paper default: (b_l, b_h) = (0.2, 0.8).
+  t_min: 0.2
+  t_max: 0.8
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
