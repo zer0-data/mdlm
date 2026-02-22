@@ -274,27 +274,55 @@ def get_text8_dataset(cache_dir, max_seq_length=256,
   return dataset
 
 
-def _group_texts(examples, block_size, bos, eos):
+def _group_texts(examples, block_size, bos, eos, eos_padding=0):
+  """Chunk tokenized text into fixed-size blocks.
+
+  When eos_padding > 0, each chunk ends with a *random* number of
+  <eos> tokens sampled from Uniform(0, eos_padding).  This forces the
+  diffusion model to learn sequence termination independently
+  (SM-MDLM paper, Section 3 / Appendix).
+
+  With eos_padding=0 the behaviour is identical to the original code
+  (exactly [BOS] + content + [EOS]).
+  """
+  import random
   # Concatenate all texts.
   concatenated_examples = list(itertools.chain(* examples['input_ids']))
   total_length = len(concatenated_examples)
-  # TODO(yair): look into not dropping the remainder but rather padding it.
-  # We drop the small remainder, and if the total_length < block_size - 2
-  # we exclude this batch and return an empty dict.
-  # We could add padding if the model supported it instead of
-  # this drop, you can customize this part to your needs.
-  new_block_size = block_size - 2  # [BOS] and [EOS] to be added
-  total_length = (total_length // new_block_size) * new_block_size
-  # Split by chunks of max_len.
+
   result = {}
   _values = []
   _attn_masks = []
-  for i in range(0, total_length, new_block_size):
-    _values.append(
-      [bos]
-      + concatenated_examples[i : i + new_block_size]
-      + [eos])
+  ptr = 0  # pointer into the concatenated stream
+
+  while ptr < total_length:
+    # Sample the number of trailing EOS tokens for this chunk.
+    # Always at least 1 EOS; extra ones come from the uniform sample.
+    if eos_padding > 0:
+      n_eos = 1 + random.randint(0, eos_padding)
+    else:
+      n_eos = 1
+
+    # Content length = block_size - 1 (BOS) - n_eos
+    content_len = block_size - 1 - n_eos
+    if content_len <= 0:
+      # Degenerate case: block too small for any content.
+      # Fall back to at least 1 content token.
+      n_eos = block_size - 2
+      content_len = 1
+
+    content = concatenated_examples[ptr : ptr + content_len]
+    if len(content) < content_len:
+      # Not enough data left for a full chunk — drop the remainder.
+      break
+    ptr += content_len
+
+    chunk = [bos] + content + [eos] * n_eos
+    assert len(chunk) == block_size, (
+      f"Chunk length {len(chunk)} != block_size {block_size}")
+    _values.append(chunk)
     _attn_masks.append(torch.ones(block_size))
+
   result['input_ids'] = _values
   result['attention_mask'] = _attn_masks
   return result
@@ -302,7 +330,8 @@ def _group_texts(examples, block_size, bos, eos):
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)),
+    streaming=False, eos_padding=50):
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
@@ -467,7 +496,8 @@ def get_dataset(
     return tokenized_dataset.with_format('torch')
 
   group_texts = functools.partial(
-    _group_texts, block_size=block_size, bos=BOS, eos=EOS)
+    _group_texts, block_size=block_size, bos=BOS, eos=EOS,
+    eos_padding=eos_padding)
   if streaming:
     chunked_dataset = tokenized_dataset.map(
       group_texts,
@@ -549,7 +579,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode='train',
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
-      block_size=config.model.length)
+      block_size=config.model.length,
+      eos_padding=getattr(config.data, 'eos_padding', 50))
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -565,7 +596,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode=validation_split,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
-      streaming=False)
+      streaming=False,
+      eos_padding=getattr(config.data, 'eos_padding', 50))
 
   if skip_train:
     train_loader = None

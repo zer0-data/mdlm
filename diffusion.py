@@ -121,7 +121,10 @@ class Diffusion(L.LightningModule):
         self.soft_masking_module = SoftMaskingModule(
             hidden_size=self.config.model.hidden_size,
             vocab_size=self.vocab_size, 
-            mask_token_id=self.mask_index
+            mask_token_id=self.mask_index,
+            k=getattr(self.config, 'sm_topk', 3),
+            feedback_mode=getattr(self.config, 'sm_feedback_mode', 'topk'),
+            tau_init=getattr(self.config, 'sm_tau_init', 1.0),
         )
         self.p_sm = getattr(self.config.training, 'p_sm', 0.5)
         # Clipped noise schedule (Algorithm 1 / Appendix A.2).

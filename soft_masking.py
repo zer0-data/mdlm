@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class SoftMaskingModule(nn.Module):
-    def __init__(self, hidden_size, vocab_size, mask_token_id, k=3, omega_s_init=0.5, omega_a_init=0.9, omega_b_init=0.3, interp_mode = 'linear'):
+    def __init__(self, hidden_size, vocab_size, mask_token_id, k=3, omega_s_init=0.5, omega_a_init=0.9, omega_b_init=0.3, interp_mode = 'linear', feedback_mode='topk', tau_init=1.0):
         super().__init__()
         self.k = k
         self.mask_token_id = mask_token_id
@@ -12,12 +12,23 @@ class SoftMaskingModule(nn.Module):
         if interp_mode not in valid_modes:
             raise ValueError(f"interp_mode must be one of {valid_modes}")
         self.interp_mode = interp_mode
+
+        valid_feedback = ['topk', 'full']
+        if feedback_mode not in valid_feedback:
+            raise ValueError(f"feedback_mode must be one of {valid_feedback}")
+        self.feedback_mode = feedback_mode
         
         # Learnable parameters for lambda calculation
         # Formula: lambda = sigmoid(omega_s * Entropy + omega_a * t + omega_b)
         self.omega_s = nn.Parameter(torch.tensor(omega_s_init))
         self.omega_a = nn.Parameter(torch.tensor(omega_a_init))
         self.omega_b = nn.Parameter(torch.tensor(omega_b_init))
+
+        # Learnable softmax temperature for 'full' feedback mode.
+        # tau = exp(log_tau) is always positive.  Stored in log-space
+        # for unconstrained optimisation.
+        if self.feedback_mode == 'full':
+            self.log_tau = nn.Parameter(torch.tensor(float(tau_init)).log())
         
         # Optimization: Register mask_token_id as a buffer to avoid repeated tensor creation
         self.register_buffer('mask_token_id_tensor', torch.tensor(mask_token_id,dtype= torch.long))
@@ -84,6 +95,23 @@ class SoftMaskingModule(nn.Module):
         feedback_embeds = torch.sum(topk_embeds * topk_probs_norm.unsqueeze(-1), dim=2)
         
         return feedback_embeds
+
+    def get_full_vocab_embeddings(self, probs, embedding_layer):
+        """Full-vocabulary temperature-scaled weighted embedding sum.
+
+        Ablation variant (paper Table 3): instead of top-k filtering,
+        use softmax(log(probs) / tau) over the *entire* vocabulary.
+        tau is a learnable temperature.
+
+        Returns: (batch, seq_len, hidden_dim)
+        """
+        tau = self.log_tau.exp()  # always positive
+        # Temperature-scaled distribution over full vocabulary
+        log_probs = torch.log(probs + 1e-10)
+        scaled_probs = F.softmax(log_probs / tau, dim=-1)  # (B, L, V)
+        # Matrix multiply: (B, L, V) @ (V, H) -> (B, L, H)
+        embed_weight = embedding_layer.weight  # (V, H)
+        return torch.matmul(scaled_probs, embed_weight)
     
     def _interpolate(self, lam, v0, v1, dot_threshold=0.9995):
         """
@@ -144,7 +172,10 @@ class SoftMaskingModule(nn.Module):
         v0 = mask_embed.expand_as(real_embeds)                   # (B, L, H)
 
         # 5. Compute feedback & lambda
-        feedback_embeds = self.get_topk_embeddings(probs, embedding_layer)
+        if self.feedback_mode == 'full':
+            feedback_embeds = self.get_full_vocab_embeddings(probs, embedding_layer)
+        else:
+            feedback_embeds = self.get_topk_embeddings(probs, embedding_layer)
         lam = self.compute_lambda(probs)               # (B, L, 1)
         
         # 6. Interpolate: v0 = mask embedding, v1 = top-k feedback
